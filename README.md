@@ -17,7 +17,8 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
    任一自然年超过该展品年度上限即拒绝，并在错误信息与页面中列出**超限年份、上限、各部分占用与超额量（lx·h）**。
 4. **并发安全**：批准/确认事务先对展品行加 `SELECT ... FOR UPDATE` 行锁，串行化同展品的并发批准，防止超配。
 5. **实测替代估算**：展后保管员在「已批准计划的开灯时段内」录入实测时段与照度，确认后该时段改按实测计量，
-   原估算的对应部分自动扣除；已确认测量记录与审批记录保留（不可修改/删除）。
+   原估算的对应部分自动扣除；已确认测量记录与审批记录保留（不可直接修改/删除；
+   录错时由保管员走第 15 条「实测纠错」：旧记录作废保留、替代记录确认并关联）。
 6. **重叠实测拒绝**：实测时段与同展品任何未作废实测时间相交即拒绝（含待确认记录）。
 7. **迟到实测导致超限**：确认实测若使某展品某自然年已用剂量超限，
    该展品在**相应年度仍有估算剂量、且尚未开始**的已批准计划自动转为 **待复核（pending_review）**，
@@ -76,6 +77,22 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
       返回 409，结构化指出涉及的**计划、年份与冲突原因**（组内重叠/外部重叠/状态已变/未登记上限/超额）。
     - 单展品成功响应与既有单条批准同构（展品详情字段位于顶层，另附 `batchApproval`）；
       跨展品成功时返回各展品最新详情。**既有单条审批与展品详情响应保持兼容。**
+15. **实测纠错（conservator only）**：保管员发现**已确认实测**的时段或照度录错时，可用
+    **原记录编号、替代时段、替代照度及必填原因**发起纠错。
+    - **替代记录仍属原计划**：替代时段须为正时长且**完整处于该计划开灯窗内**（按计划当前展期/开灯时段
+      校验，计划待复核/取消后仍可更正其历史实测）；**不得与同展品其他未作废实测（含待确认草稿）或
+      停灯记录相交**（原记录自身排除）。非法时段/照度、越窗、原记录非已确认（草稿可删、已作废须对其
+      替代记录纠错）返回 **400**；相交冲突返回 **409** 并在 `details` 一次性指出全部冲突实测/停灯；
+      **任何失败原记录与额度均不变**。
+    - 核对通过后在**展品锁事务**内：**保留旧记录并标记作废（annulled，不删改剂量字段）**、
+      **确认替代记录**（直接 confirmed）、写入两者关联（`replacesMeasurementId` / `replacedById`）
+      与必填纠错原因、写审计（`measurement.correct`）；随后按既有**自然年口径**重算
+      **已确认实测与估算残余**（已确认实测替代估算、停灯只扣估算残余的口径不变）。
+    - 若纠错使任一年度超额，**沿用现有确认实测的生效与冲突响应口径**：纠错照常生效，返回 **409** 并把
+      相关年度仍有估算残余且**尚未开始的已批准计划转待复核**（原因写明由实测纠错触发）；
+      **占用下降不自动恢复任何既有待复核计划**（须保管员按既有重叠+额度口径复核）。
+    - 展品详情与实测列表可**追溯前后记录与原因**（仅附加字段，既有字段不变）；
+      实测纠错可链式进行（始终对当前有效的已确认记录发起）。
 
 ## 一键启动（Docker Compose）
 
@@ -170,8 +187,13 @@ npm run test:utils
     与其他已批准/待复核计划重叠、超额/未登记上限）；确认无误后由保管员**提交联合核准**：
     系统在锁事务内重新核对计划状态与实时占用，全部通过才一次批准整组（逐条 + 汇总留痕），
     任一失败整组计划与审计均不变，并返回涉及的计划、年份与冲突原因。
+11. 展后发现**已确认实测**的时段或照度录错时，保管员在展品详情「实测记录」或「实测记录」页对该记录点
+    **「纠错」**：填替代时段、替代照度与必填原因后提交。系统校验替代时段完整处于原计划开灯窗内、
+    不与同展品其他未作废实测或停灯相交；通过后旧记录保留并标记作废、替代记录直接确认并互相关联，
+    按自然年重算已确认实测与估算残余。若纠错造成年度超额，纠错仍生效，相关未开始已批准计划转待复核；
+    占用下降不会自动恢复待复核计划。展品详情可追溯前后记录与纠错原因。
 
-## HTTP API（含计划调整申请、成对核准、**联合核准**、年度上限下调预演、停灯登记）
+## HTTP API（含计划调整申请、成对核准、**联合核准**、年度上限下调预演、停灯登记、**实测纠错**）
 
 所有接口除 `/api/health`、`/api/auth/login` 外都需要登录会话（HttpOnly Cookie `lqsession`）。
 统一错误形态：`{ "error": "中文原因", "details": { ... } }`，409 用于冲突（重叠/超额/重复申请）。
@@ -207,6 +229,7 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | `POST /api/plans/:id/reject` | 保管员 | 驳回落计划 |
 | `POST /api/plans/:id/cancel` | 登录 | 取消（布展员仅自己未批准的；保管员均可） |
 | `GET/POST /api/measurements`、`POST /api/measurements/:id/confirm`、`DELETE /api/measurements/:id` | 保管员 | 实测录入/确认/删草稿 |
+| `POST /api/measurements/:id/correct` | 保管员 | **实测纠错**：原记录作废保留 + 替代记录确认，按自然年重算；超额 409 并转待复核 |
 | `GET /api/blackouts?exhibitId=&planId=` | 登录 | 停灯记录列表（布展员只读），逐条附 `yearly` 按年扣减量；另返回 `blackoutDeductionByExhibit` |
 | `POST /api/blackouts` | 保管员 | 登记已发生停灯时段；成功响应为展品详情（另附 `blackout`）；冲突 409 不保存 |
 | `GET /api/audit` | 保管员 | 操作流水（含 `blackout.create`） |
@@ -632,6 +655,124 @@ curl -b cookies.txt -X DELETE http://localhost:3000/api/blackouts/1
 后续对停灯时段录入/确认实测同样被拒（409，`details.overlappingBlackoutId`）。
 调整申请/成对核准试算的 `conflicts.outsideBlackouts` 会列出落在拟改新窗之外的既有停灯。
 
+### 实测纠错 `/api/measurements/:id/correct`（保管员）
+
+保管员发现**已确认实测**的时段或照度录错时，用**原记录编号**（路径 `:id`）、**替代时段**、
+**替代照度**与**必填纠错原因**发起纠错。布展员调用 → 403。
+
+- 替代时段与实测录入同形（墙上时间，可跨日）：`startDate/startTime/endDate/endTime`。
+- 替代记录**仍属原计划**：时段须正时长且完整处于**该计划当前开灯窗**内（不校验计划状态）；
+  不得与同展品**其他未作废实测（含待确认草稿）或停灯记录**相交。
+- 草稿不能纠错（400，可删除重录）；已作废记录不能再次纠错（400，应对其当前有效的替代记录发起）。
+- 成功（200）在展品锁事务内保留旧记录并标记 `annulled`、确认替代记录、写双向关联与原因及审计，
+  并按自然年重算占用；成功响应为**展品详情**（与 `GET /api/exhibits/:id` 同构，保持兼容），另附
+  `correction` 摘要。
+- 若纠错使年度超额，响应为 **409**（纠错仍已生效）：`overflows` / `flaggedPlans` 与确认实测同构，
+  `detail` 为最新展品详情，另附 `correction`；**占用下降不恢复既有待复核计划**。
+
+请求体：
+
+```json
+{
+  "startDate": "2032-06-01",
+  "startTime": "09:00",
+  "endDate": "2032-06-01",
+  "endTime": "13:00",
+  "actualLux": 150,
+  "reason": "照度计读数与结束时刻均录错"
+}
+```
+
+curl 调用示例（保管员 Cookie 存于 cookies-custodian.txt）：
+
+```bash
+# 对已确认实测 #31 发起纠错（成功 200：原记录作废保留，替代记录直接确认）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurements/31/correct \
+  -H 'Content-Type: application/json' \
+  -d '{"startDate":"2032-06-01","startTime":"09:00",
+       "endDate":"2032-06-01","endTime":"13:00",
+       "actualLux":150,"reason":"照度计读数与结束时刻均录错"}'
+```
+
+成功响应（展品详情字段位于顶层，另附 `correction`）：
+
+```json
+{
+  "exhibit": { }, "years": { }, "sources": [ ], "plans": [ ], "measurements": [ ],
+  "correction": {
+    "originalMeasurementId": 31,
+    "replacementMeasurementId": 32,
+    "reason": "照度计读数与结束时刻均录错",
+    "original":    { "id": 31, "start": "2032-06-01 09:00", "end": "2032-06-01 12:00",
+                     "actualLux": 100, "yearly": { "2032": 300 } },
+    "replacement": { "id": 32, "start": "2032-06-01 09:00", "end": "2032-06-01 13:00",
+                     "actualLux": 150, "yearly": { "2032": 600 } }
+  }
+}
+```
+
+展品详情 / 实测列表中每条实测**仅附加**以下追溯字段（无纠错时为 `null`，既有消费者不受影响）：
+
+```json
+{
+  "id": 31, "status": "annulled",
+  "replacesMeasurementId": null,
+  "replacedById": 32,
+  "correctionReason": "照度计读数与结束时刻均录错",
+  "annulledBy": 1, "annulledAt": "2032-06-02T01:23:45.000Z"
+}
+```
+```json
+{
+  "id": 32, "status": "confirmed",
+  "replacesMeasurementId": 31,
+  "replacedById": null,
+  "correctionReason": "照度计读数与结束时刻均录错"
+}
+```
+
+非法输入（400）示例：原记录是草稿/已作废、替代时段结束不晚于开始、非正照度、替代时段越出原计划
+开灯窗、缺少原因：
+
+```json
+{ "error": "替代时段 2032-06-01 08:00 ~ 2032-06-01 12:00 没有完整落在原计划 #7 的开灯窗内" }
+```
+
+相交冲突（409）一次性指出全部冲突且**不保存**（原记录与额度不变）：
+
+```json
+{
+  "error": "实测纠错失败：与已确认实测 #35（2032-06-01 14:00 ~ 2032-06-01 15:00）相交；与停灯记录 #2（计划「夜场」，2032-06-01 11:30 ~ 2032-06-01 12:30）相交，未保存",
+  "details": {
+    "overlappingMeasurements": [
+      { "id": 35, "planId": 7, "status": "confirmed",
+        "start": "2032-06-01 14:00", "end": "2032-06-01 15:00" }
+    ],
+    "overlappingBlackouts": [
+      { "id": 2, "planId": 7, "planTitle": "夜场",
+        "start": "2032-06-01 11:30", "end": "2032-06-01 12:30" }
+    ]
+  }
+}
+```
+
+纠错导致年度超额时（**纠错已生效**，与确认实测同口径返回 409 并转待复核）：
+
+```json
+{
+  "message": "实测纠错已生效（#31 → #32），但纠错后超限：2032 年超出 800 lx·h。已将 1 条尚未开始的计划转为待复核",
+  "overflows": [{ "year": 2032, "limit": 1600, "projected": 2400, "excess": 800 }],
+  "flaggedPlans": [
+    { "id": 9, "title": "未来计划2", "firstStart": "2032-08-01 09:00", "overflowYears": [2032] }
+  ],
+  "correction": { "originalMeasurementId": 31, "replacementMeasurementId": 32 },
+  "detail": { }
+}
+```
+
+审计写入一条 `measurement.correct`（target 为替代记录，detail 含原/替代编号、原因、前后时段照度
+与按年剂量、超额年份）；由纠错触发的计划转待复核写 `plan.flag_review`，原因中注明实测纠错。
+
 
 
 ```
@@ -647,8 +788,8 @@ src/
   limit-preview.js 下调上限预演凭证（签发/一次性消耗/占用指纹）
   validation.js    中文输入校验（时段/日期/正数等）
   dosing.js        剂量核心算法：时间窗、按年拆分、区间扣除、重叠/包含判断
-  service.js       额度占用计算、批准校验、实测窗口校验、待复核筛选、调整申请试算/核对（含成对核准）、联合核准整组试算/核对、下调上限预演核算、停灯登记校验与按年扣减
-  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements/blackouts/audit 路由
+  service.js       额度占用计算、批准校验、实测窗口校验、实测纠错（旧记录作废+替代记录确认+关联）、待复核筛选、调整申请试算/核对（含成对核准）、联合核准整组试算/核对、下调上限预演核算、停灯登记校验与按年扣减
+  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/blackouts/audit 路由
 public/            原生 HTML/CSS/JS 单页界面
 scripts/test-utils.js  核心算法离线测试
 Dockerfile / docker-compose.yml

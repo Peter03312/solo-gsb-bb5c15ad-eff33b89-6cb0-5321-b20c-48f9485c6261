@@ -388,18 +388,36 @@ function pendingAdjustmentBlock(p) {
     <div class="adj-btns">${btns.join(' ')}</div>
   </div>`;
 }
+function correctionTraceHtml(m) {
+  if (m.replacesMeasurementId) {
+    return `<div class="small ok">替代记录（替代 #${m.replacesMeasurementId}）</div>
+      <div class="small muted">纠错原因：${esc(m.correctionReason || '')}</div>`;
+  }
+  if (m.status === 'annulled' && m.replacedById) {
+    return `<div class="small muted">已被替代：#${m.replacedById}</div>
+      <div class="small muted">纠错原因：${esc(m.correctionReason || '')}</div>`;
+  }
+  return '';
+}
+
 function measRow(m) {
   const plan = (state.detail.plans || []).find((p) => p.id === m.planId);
+  let actions = '<span class="muted">—</span>';
+  if (state.user.role === 'conservator') {
+    if (m.status === 'draft') {
+      actions = `<button class="primary small-btn meas-action" data-action="confirm" data-id="${m.id}">确认</button>
+         <button class="danger small-btn meas-action" data-action="delete" data-id="${m.id}">删除</button>`;
+    } else if (m.status === 'confirmed') {
+      actions = `<button class="small-btn meas-action" data-action="correct" data-id="${m.id}">纠错</button>`;
+    }
+  }
   return `<tr>
     <td>${m.id}</td>
     <td>#${m.planId} ${esc(plan ? plan.title : '')}</td>
     <td>${esc(m.start)}</td><td>${esc(m.end)}</td>
     <td class="mono">${fmtN(m.actualLux)}</td>
-    <td>${badge(m.status)}</td>
-    <td>${m.status === 'draft' && state.user.role === 'conservator'
-      ? `<button class="primary small-btn meas-action" data-action="confirm" data-id="${m.id}">确认</button>
-         <button class="danger small-btn meas-action" data-action="delete" data-id="${m.id}">删除</button>`
-      : '<span class="muted">—</span>'}</td>
+    <td>${badge(m.status)}${correctionTraceHtml(m)}</td>
+    <td>${actions}</td>
   </tr>`;
 }
 
@@ -589,6 +607,54 @@ async function measAction(btn) {
     if (action === 'delete') {
       if (!confirm(`删除待确认实测 #${id}？`)) return;
       await api('DELETE', `/api/measurements/${id}`);
+    } else if (action === 'correct') {
+      const list = state.detail ? state.detail.measurements : state.measurements;
+      const m = (list || []).find((x) => x.id === Number(id));
+      const startDate = prompt(`实测 #${id} 纠错：替代开始日期（YYYY-MM-DD）`, m ? m.start.slice(0, 10) : '');
+      if (startDate === null) return;
+      const startTime = prompt('替代开始时间（HH:MM）', m ? m.start.slice(11, 16) : '09:00');
+      if (startTime === null) return;
+      const endDate = prompt('替代结束日期（YYYY-MM-DD，同日可重填开始日期）', startDate);
+      if (endDate === null) return;
+      const endTime = prompt('替代结束时间（HH:MM）', m ? m.end.slice(11, 16) : '12:00');
+      if (endTime === null) return;
+      const luxRaw = prompt('替代实测照度（lx）', m ? String(m.actualLux) : '');
+      if (luxRaw === null) return;
+      const reason = prompt('纠错原因（必填）', '');
+      if (reason === null) return;
+      try {
+        const detail = await api('POST', `/api/measurements/${id}/correct`, {
+          startDate: startDate.trim(), startTime: startTime.trim(),
+          endDate: endDate.trim(), endTime: endTime.trim(),
+          actualLux: Number(luxRaw), reason: reason.trim(),
+        });
+        if (state.detail) {
+          state.detail = detail;
+          renderDetail();
+        } else {
+          await loadMeasurementsTab();
+        }
+        flash('success',
+          `实测 #${id} 已纠错：原记录保留作废，替代记录 #${detail.correction.replacementMeasurementId} 已确认`);
+        return;
+      } catch (err) {
+        if (err.status === 409 && err.data && err.data.correction) {
+          const html = '<ul>' + (err.data.overflows || []).map((o) =>
+            `<li>${o.year} 年：纠错后合计 ${fmtN(o.projected)}，<b>超额 ${fmtN(o.excess)} lx·h</b></li>`
+          ).join('') + '</ul>'
+            + (err.data.flaggedPlans && err.data.flaggedPlans.length
+              ? '<div>已转为待复核的计划：' + err.data.flaggedPlans.map((p) => `#${p.id}《${esc(p.title)}》`).join('、') + '</div>'
+              : '');
+          if (err.data.detail) {
+            state.detail = err.data.detail;
+            renderDetail();
+          }
+          flash('warn',
+            `纠错已生效（#${id} → #${err.data.correction.replacementMeasurementId}），但造成超限`, html);
+          return;
+        }
+        throw err;
+      }
     } else if (action === 'confirm') {
       try {
         const detail = await api('POST', `/api/measurements/${id}/confirm`);
@@ -959,17 +1025,19 @@ async function loadMeasurementsTab() {
   state.measurements = measurements;
   $('#meas-list').innerHTML = measurements.length
     ? `<table class="data"><thead><tr>
-        <th>#</th><th>计划</th><th>开始</th><th>结束</th><th>实测照度</th><th>状态</th><th>操作</th></tr></thead>
+        <th>#</th><th>计划</th><th>开始</th><th>结束</th><th>实测照度</th><th>状态 / 纠错追溯</th><th>操作</th></tr></thead>
         <tbody>${measurements.map((m) => `
           <tr>
             <td>${m.id}</td><td>#${m.planId}</td>
             <td>${esc(m.start)}</td><td>${esc(m.end)}</td>
             <td class="mono">${fmtN(m.actualLux)} lx</td>
-            <td>${badge(m.status)}</td>
+            <td>${badge(m.status)}${correctionTraceHtml(m)}</td>
             <td>${m.status === 'draft' && state.user.role === 'conservator'
               ? `<button class="primary small-btn meas-action" data-action="confirm" data-id="${m.id}">确认</button>
                  <button class="danger small-btn meas-action" data-action="delete" data-id="${m.id}">删除</button>`
-              : '<span class="muted">—</span>'}</td>
+              : (m.status === 'confirmed' && state.user.role === 'conservator'
+                ? `<button class="small-btn meas-action" data-action="correct" data-id="${m.id}">纠错</button>`
+                : '<span class="muted">—</span>')}</td>
           </tr>`).join('')}</tbody></table>`
     : '<p class="muted">暂无实测记录。</p>';
   $$('.meas-action').forEach((b) => b.addEventListener('click', () => measAction(b)));

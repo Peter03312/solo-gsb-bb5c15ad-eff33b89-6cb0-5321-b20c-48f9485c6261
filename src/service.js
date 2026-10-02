@@ -442,6 +442,124 @@ async function validateMeasurementWindow(client, plan, startYmd, startMinute, en
 }
 
 /**
+ * 实测纠错（由路由在展品锁事务内、已持有展品行锁后调用）：
+ * 保管员对一条「已确认」实测发起纠错：
+ *  - 原记录必须存在且为 confirmed；draft 不能纠错（可直接删除重录），annulled 不能再次纠错
+ *    （应对其当前有效的替代记录发起）。
+ *  - 替代记录仍属原计划：替代时段必须正时长且完整落在原计划当前开灯窗内（不校验计划状态，
+ *    计划取消/待复核后仍允许对历史实测纠错，窗口以计划现有展期/开灯时段为准）。
+ *  - 替代时段不得与同展品「其他未作废实测（含待确认草稿）」或任何停灯记录相交；
+ *    原记录自身排除（它随后即被作废）。
+ *  - 替代照度必须为正，纠错原因必填。
+ * 输入/窗口/原因类错误抛 ValidationError（400）；相交冲突一次性收集后抛 ConflictError（409），
+ * 任何失败都不改动数据。
+ * 通过后：原记录保留并置 annulled（记 annulled_by/at、replaced_by_id、correction_reason），
+ * 插入一条直接 confirmed 的替代记录（记 confirmed_by/at、replaces_measurement_id、correction_reason）。
+ * 返回 { plan, original, replacement, startMs, endMs, lux, reason }。
+ */
+async function correctMeasurement(client, originalId, input, actor) {
+  const mRows = await client.query('SELECT * FROM measurements WHERE id = $1 FOR UPDATE', [originalId]);
+  const original = mRows.rows[0];
+  if (!original) throw new ValidationError('实测记录不存在');
+  if (original.status === 'annulled') {
+    throw new ValidationError('该实测已作废，不能再次纠错；请对其当前有效的替代记录发起纠错');
+  }
+  if (original.status === 'draft') {
+    throw new ValidationError('只有已确认实测才能纠错；待确认记录可直接删除后重新录入');
+  }
+
+  const plan = await getPlan(client, original.plan_id);
+  const startMs = wallToTs(input.startDate, input.startMinute);
+  const endMs = wallToTs(input.endDate, input.endMinute);
+  if (!(endMs > startMs)) throw new ValidationError('替代时段结束必须晚于开始');
+  const lux = positiveNumber(input.actualLux, '替代实测照度（lx）', { max: 1000000 });
+  const reason = nonEmptyString(input.reason, '纠错原因', 1000);
+
+  const windows = planWindows(plan);
+  const seg = { start: startMs, end: endMs };
+  if (!windows.some((w) => containsInterval(w, seg))) {
+    throw new ValidationError(
+      `替代时段 ${tsToWallString(startMs)} ~ ${tsToWallString(endMs)} ` +
+        `没有完整落在原计划 #${plan.id} 的开灯窗内`
+    );
+  }
+
+  // 冲突一次性收集：其他未作废实测（含草稿，排除原记录）与停灯记录
+  const { rows: measRows } = await client.query(
+    `SELECT id, plan_id, start_ts, end_ts, status
+       FROM measurements
+      WHERE exhibit_id = $1 AND id <> $2 AND status <> 'annulled'
+        AND start_ts < $4 AND end_ts > $3
+      ORDER BY id`,
+    [plan.exhibit_id, originalId, new Date(startMs), new Date(endMs)]
+  );
+  const { rows: blackoutRows } = await client.query(
+    `SELECT id, plan_id, start_ts, end_ts FROM blackouts
+      WHERE exhibit_id = $1
+        AND start_ts < $3 AND end_ts > $2
+      ORDER BY id`,
+    [plan.exhibit_id, new Date(startMs), new Date(endMs)]
+  );
+  if (measRows.length > 0 || blackoutRows.length > 0) {
+    const planIds = [...new Set(blackoutRows.map((b) => Number(b.plan_id)))];
+    const titleMap = new Map();
+    if (planIds.length > 0) {
+      const placeholders = planIds.map((_, i) => `$${i + 1}`).join(',');
+      const tRows = await client.query(
+        `SELECT id, title FROM plans WHERE id IN (${placeholders})`,
+        planIds
+      );
+      for (const t of tRows.rows) titleMap.set(Number(t.id), t.title);
+    }
+    const overlappingMeasurements = measRows.map((m) => ({
+      id: m.id,
+      planId: m.plan_id,
+      status: m.status,
+      start: tsToWallString(new Date(m.start_ts).getTime()),
+      end: tsToWallString(new Date(m.end_ts).getTime()),
+    }));
+    const overlappingBlackouts = blackoutRows.map((b) => ({
+      id: b.id,
+      planId: b.plan_id,
+      planTitle: titleMap.get(Number(b.plan_id)) || null,
+      start: tsToWallString(new Date(b.start_ts).getTime()),
+      end: tsToWallString(new Date(b.end_ts).getTime()),
+    }));
+    const parts = [];
+    for (const m of overlappingMeasurements) {
+      parts.push(`与${m.status === 'draft' ? '待确认' : '已确认'}实测 #${m.id}（${m.start} ~ ${m.end}）相交`);
+    }
+    for (const b of overlappingBlackouts) {
+      parts.push(`与停灯记录 #${b.id}（计划「${b.planTitle}」，${b.start} ~ ${b.end}）相交`);
+    }
+    throw new ConflictError(`实测纠错失败：${parts.join('；')}，未保存`, {
+      overlappingMeasurements,
+      overlappingBlackouts,
+    });
+  }
+
+  const inserted = await client.query(
+    `INSERT INTO measurements
+       (plan_id, exhibit_id, start_ts, end_ts, actual_lux, note, status,
+        created_by, confirmed_by, confirmed_at, replaces_measurement_id, correction_reason)
+     VALUES ($1, $2, $3, $4, $5, $6, 'confirmed', $7, $7, now(), $8, $9)
+     RETURNING *`,
+    [plan.id, plan.exhibit_id, new Date(startMs), new Date(endMs), lux,
+      original.note || null, actor.userId, originalId, reason]
+  );
+  const replacement = inserted.rows[0];
+  await client.query(
+    `UPDATE measurements
+        SET status = 'annulled', annulled_by = $1, annulled_at = now(),
+            replaced_by_id = $2, correction_reason = $3
+      WHERE id = $4`,
+    [actor.userId, replacement.id, reason, originalId]
+  );
+
+  return { plan, original, replacement, startMs, endMs, lux, reason };
+}
+
+/**
  * 校验并登记停灯时段（由路由在展品锁事务内调用）：
  *  - 计划必须为已批准或待复核
  *  - 起点须早于终点；结束不得晚于当前时间（只登记已发生时段）
@@ -1599,6 +1717,7 @@ module.exports = {
   buildOverflows,
   planOverlaps,
   validateMeasurementWindow,
+  correctMeasurement,
   plansToFlag,
   computeLimitPreview,
   yearOfTs,

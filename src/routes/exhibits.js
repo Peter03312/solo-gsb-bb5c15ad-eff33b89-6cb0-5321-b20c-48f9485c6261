@@ -22,6 +22,16 @@ function serializeMeasurement(m) {
     status: m.status,
     note: m.note,
     createdAt: m.created_at,
+    // 实测纠错追溯（无纠错时均为 null，既有消费者不受影响）
+    replacesMeasurementId:
+      m.replaces_measurement_id != null ? Number(m.replaces_measurement_id) : null,
+    replacedById: m.replaced_by_id != null ? Number(m.replaced_by_id) : null,
+    correctionReason: m.correction_reason != null ? m.correction_reason : null,
+    annulledBy: m.annulled_by != null ? Number(m.annulled_by) : null,
+    annulledAt: m.annulled_at || null,
+    confirmedBy: m.confirmed_by != null ? Number(m.confirmed_by) : null,
+    confirmedAt: m.confirmed_at || null,
+    planTitle: m.plan_title != null ? m.plan_title : (m.planTitle || null),
   };
 }
 

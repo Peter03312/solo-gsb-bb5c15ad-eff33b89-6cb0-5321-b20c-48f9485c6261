@@ -10,7 +10,9 @@
  *       联合核准（2~10 条待批准计划：组内重叠/外部重叠、年度残余合并超额、未登记上限、
  *                 状态与实时占用重核、失败整组不变、逐条+汇总审计、跨展品组）、
  *       下调年度上限的预演/凭证提交、占用变化拒绝并返回新结果、旧接口同事务即时重算、
- *       未开始计划转待复核（写明原因）、已开始计划保留且超额如实显示。
+ *       未开始计划转待复核（写明原因）、已开始计划保留且超额如实显示、
+ *       实测纠错（替代仍属原计划、越窗/相交/非法数值拒绝、旧记录作废保留+替代确认+双向关联、
+ *                 自然年重算、纠错超额转待复核、占用下降不恢复待复核、链式纠错、取消计划后纠错）。
  */
 
 process.env.SEED_DEMO = 'false';
@@ -1643,12 +1645,278 @@ async function runFlow() {
   assert(r.body.details.preview.used === 500,
     `最新预演反映停灯扣减后 used=500，实际 ${r.body.details.preview.used}`);
 
+  // =======================================================================
+  // 实测纠错（保管员）：原记录编号 + 替代时段/照度 + 必填原因
+  // 旧记录保留作废、替代记录确认、双向关联与审计；按自然年重算；
+  // 非法数值/越窗/冲突指出原因；超额转待复核；占用下降不恢复待复核。
+  // =======================================================================
+  const exCo = await createExhibit('实测纠错展品');
+  await call('POST', `/api/exhibits/${exCo}/limits`, { year: 2035, limitLxh: 100000 }, 'c');
+
+  // 承载计划：2035-06-01 全天 09-17，100lx（确定尚未开始）
+  const coPlan = await submitPlan(exCo, '纠错承载计划', '2035-06-01', '2035-06-01',
+    ['09:00-17:00'], 100);
+  await approvePlan(coPlan);
+  // 同展品另一条已批准未开始计划（超额时应一起被转待复核）
+  const coOther = await submitPlan(exCo, '纠错相邻计划', '2035-07-01', '2035-07-01',
+    ['09:00-17:00'], 100);
+  await approvePlan(coOther);
+
+  // 原始已确认实测：2035-06-01 09:00-12:00，100lx = 300
+  r = await call('POST', '/api/measurements', {
+    planId: coPlan, startDate: '2035-06-01', startTime: '09:00',
+    endDate: '2035-06-01', endTime: '12:00', actualLux: 100,
+  }, 'c');
+  assert(r.status === 201, '录入原实测草稿');
+  const coMeas1 = r.body.measurement.id;
+  await call('POST', `/api/measurements/${coMeas1}/confirm`, {}, 'c');
+
+  // 另一条已确认实测：14:00-15:00，100lx = 100（用于冲突测试）
+  r = await call('POST', '/api/measurements', {
+    planId: coPlan, startDate: '2035-06-01', startTime: '14:00',
+    endDate: '2035-06-01', endTime: '15:00', actualLux: 100,
+  }, 'c');
+  const coMeasBlock = r.body.measurement.id;
+  await call('POST', `/api/measurements/${coMeasBlock}/confirm`, {}, 'c');
+
+  // ---- 权限 / 组成性校验 ----
+  r = await call('POST', `/api/measurements/${coMeas1}/correct`, {
+    startDate: '2035-06-01', startTime: '09:00',
+    endDate: '2035-06-01', endTime: '12:00', actualLux: 110, reason: '照度录错',
+  }, 'i');
+  assert(r.status === 403, '布展员不能发起实测纠错');
+
+  r = await call('POST', `/api/measurements/${coMeas1}/correct`, {
+    startDate: '2035-06-01', startTime: '09:00',
+    endDate: '2035-06-01', endTime: '12:00', actualLux: 110,
+  }, 'c');
+  assert(r.status === 400 && /纠错原因/.test(r.body.error), '纠错原因必填');
+
+  r = await call('POST', `/api/measurements/${coMeas1}/correct`, {
+    startDate: '2035-06-01', startTime: '11:00',
+    endDate: '2035-06-01', endTime: '10:00', actualLux: 110, reason: '时段录错',
+  }, 'c');
+  assert(r.status === 400 && /晚于开始/.test(r.body.error), '替代时段非正时长被拒');
+
+  r = await call('POST', `/api/measurements/${coMeas1}/correct`, {
+    startDate: '2035-06-01', startTime: '09:00',
+    endDate: '2035-06-01', endTime: '12:00', actualLux: 0, reason: '照度录错',
+  }, 'c');
+  assert(r.status === 400 && /正数/.test(r.body.error), '非法（非正）替代照度被拒');
+
+  r = await call('POST', `/api/measurements/999999/correct`, {
+    startDate: '2035-06-01', startTime: '09:00',
+    endDate: '2035-06-01', endTime: '12:00', actualLux: 110, reason: '照度录错',
+  }, 'c');
+  assert(r.status === 400 && /不存在/.test(r.body.error), '原记录不存在被拒');
+
+  // ---- 越窗：替代时段必须完整处于原计划开灯窗 ----
+  r = await call('POST', `/api/measurements/${coMeas1}/correct`, {
+    startDate: '2035-06-01', startTime: '08:00',
+    endDate: '2035-06-01', endTime: '12:00', actualLux: 110, reason: '时段录错',
+  }, 'c');
+  assert(r.status === 400 && /开灯窗/.test(r.body.error), '替代时段越出开灯窗（起点在窗外）被拒');
+  r = await call('POST', `/api/measurements/${coMeas1}/correct`, {
+    planId: coOther, startDate: '2035-07-01', startTime: '09:00',
+    endDate: '2035-07-01', endTime: '12:00', actualLux: 110, reason: '挪到别的计划',
+  }, 'c');
+  assert(r.status === 400 && /原计划/.test(r.body.error),
+    '替代记录仍属原计划：写到其他计划窗口被拒（按原计划窗校验）');
+
+  // ---- 冲突：与其他未作废实测 / 停灯相交（原记录自身排除）----
+  // 与 14:00-15:00 已确认实测相交
+  r = await call('POST', `/api/measurements/${coMeas1}/correct`, {
+    startDate: '2035-06-01', startTime: '13:30',
+    endDate: '2035-06-01', endTime: '15:30', actualLux: 110, reason: '时段录错',
+  }, 'c');
+  assert(r.status === 409, '替代时段与其他实测相交被拒（409）');
+  assert(r.body.details.overlappingMeasurements.some((m) => m.id === coMeasBlock),
+    '冲突明细指出相交实测');
+  // 失败后原记录与额度不变
+  r = await call('GET', `/api/exhibits/${exCo}`, null, 'i');
+  const mStill = r.body.measurements.find((m) => m.id === coMeas1);
+  assert(mStill.status === 'confirmed' && mStill.replacedById === null,
+    '纠错失败：原记录仍已确认、未被作废');
+  // 当时占用：已确认实测 300+100=400；承载计划残余 (8−3−1)h*100=400；相邻计划 800
+  assert(r.body.years['2035'].used === 1600,
+    `纠错失败：2035 占用不变（实测400+承载残余400+相邻800=1600），实际=${r.body.years['2035'].used}`);
+
+  // ---- 成功纠错：09:00-12:00（3h,100lx=300）→ 09:00-13:00（4h,150lx=600）----
+  r = await call('POST', `/api/measurements/${coMeas1}/correct`, {
+    startDate: '2035-06-01', startTime: '09:00',
+    endDate: '2035-06-01', endTime: '13:00', actualLux: 150, reason: '照度与结束时刻均录错',
+  }, 'c');
+  assert(r.status === 200, `纠错成功（实际 ${r.status} ${r.body && r.body.error}）`);
+  const coMeas2 = r.body.correction.replacementMeasurementId;
+  assert(coMeas2 !== coMeas1 && r.body.correction.originalMeasurementId === coMeas1,
+    '成功响应附纠错摘要（原/替代记录编号）');
+  assert(r.body.correction.replacement.yearly['2035'] === 600 &&
+    r.body.correction.original.yearly['2035'] === 300,
+    '纠错摘要列出替代 600 / 原 300 的按年剂量');
+
+  // 展品详情可追溯前后记录与原因
+  r = await call('GET', `/api/exhibits/${exCo}`, null, 'i');
+  const oldRow = r.body.measurements.find((m) => m.id === coMeas1);
+  const newRow = r.body.measurements.find((m) => m.id === coMeas2);
+  assert(oldRow.status === 'annulled' && oldRow.replacedById === coMeas2 &&
+    oldRow.correctionReason === '照度与结束时刻均录错',
+    '旧记录保留、标记作废并指向替代记录与原因');
+  assert(newRow.status === 'confirmed' && newRow.replacesMeasurementId === coMeas1 &&
+    newRow.correctionReason === '照度与结束时刻均录错',
+    '替代记录为已确认并指向原记录与原因');
+
+  // 重算：2035 已确认实测 600+100=700；承载计划残余 = (8h − 4h新实测 − 1h另一实测)*100 = 300；
+  //       相邻计划残余 800；合计 1800
+  assert(r.body.years['2035'].used === 1800,
+    `纠错成功后 2035 占用=实测700 + 承载残余300 + 相邻800 = 1800，实际 ${r.body.years['2035'].used}`);
+  // 已作废记录不再出现在占用来源（只由替代记录计量）
+  assert(!r.body.sources.some((s) => s.kind === 'measurement' && s.id === coMeas1),
+    '已作废原记录不再计入已确认实测占用');
+  assert(r.body.sources.some((s) => s.kind === 'measurement' && s.id === coMeas2 &&
+    s.yearly['2035'] === 600), '替代记录计入已确认实测占用');
+
+  // 审计：纠错事件
+  r = await call('GET', '/api/audit?limit=1000', null, 'c');
+  assert(r.body.events.some((e) => e.action === 'measurement.correct' &&
+    Number(e.target_id) === coMeas2), '操作流水记录了实测纠错（target 为替代记录）');
+
+  // ---- 已作废记录不能再次纠错；替代记录可以继续纠错（纠错链）----
+  r = await call('POST', `/api/measurements/${coMeas1}/correct`, {
+    startDate: '2035-06-01', startTime: '09:00',
+    endDate: '2035-06-01', endTime: '10:00', actualLux: 120, reason: '再改',
+  }, 'c');
+  assert(r.status === 400 && /已作废/.test(r.body.error), '已作废记录不能再次纠错');
+
+  // ---- 纠错使年度超额：另建一件展品验证“纠错前不超、纠错后超 → 转待复核”----
+  const exCo2 = await createExhibit('纠错超额展品');
+  await call('POST', `/api/exhibits/${exCo2}/limits`, { year: 2035, limitLxh: 100000 }, 'c');
+  const cp1 = await submitPlan(exCo2, '超额承载计划', '2035-06-01', '2035-06-01',
+    ['09:00-17:00'], 100); // 800
+  const cp2 = await submitPlan(exCo2, '超额未开始计划', '2035-08-01', '2035-08-01',
+    ['09:00-17:00'], 100); // 800
+  await approvePlan(cp1);
+  await approvePlan(cp2);
+  // 原实测：09:00-12:00 100lx = 300；占用 = 300 + 承载残余 500 + cp2 800 = 1600
+  // 确认后再收紧上限到“纠错前不超、纠错后超”：
+  r = await call('POST', '/api/measurements', {
+    planId: cp1, startDate: '2035-06-01', startTime: '09:00',
+    endDate: '2035-06-01', endTime: '12:00', actualLux: 100,
+  }, 'c');
+  const cm1 = r.body.measurement.id;
+  await call('POST', `/api/measurements/${cm1}/confirm`, {}, 'c');
+  // used = 300 + 承载残余 500 + 800 = 1600；收紧上限到 1600（纠错前恰好不超），
+  // 纠错为 09-17 全天 200lx=1600 后超额
+  await call('POST', `/api/exhibits/${exCo2}/limits`, { year: 2035, limitLxh: 1600 }, 'c');
+  r = await call('GET', `/api/exhibits/${exCo2}`, null, 'i');
+  assert(r.body.years['2035'].used === 1600 && r.body.years['2035'].over === false,
+    `纠错前 2035 占用 1600、上限 1600 不超限，实际=${r.body.years['2035'].used}/${r.body.years['2035'].limit}`);
+  // 纠错：1600 实测 + cp2 残余 800 = 2400（承载计划被全天覆盖，残余 0），超额 900
+  r = await call('POST', `/api/measurements/${cm1}/correct`, {
+    startDate: '2035-06-01', startTime: '09:00',
+    endDate: '2035-06-01', endTime: '17:00', actualLux: 200, reason: '照度与时段均录错（全天）',
+  }, 'c');
+  assert(r.status === 409, '纠错导致年度超额：纠错生效并返回 409');
+  const cof = r.body.overflows.find((o) => o.year === 2035);
+  assert(cof && cof.excess === 800 && cof.projected === 2400,
+    `纠错超额 800、合计 2400（上限 1600），实际=${JSON.stringify(r.body.overflows)}`);
+  assert(r.body.flaggedPlans.some((p) => p.id === cp2),
+    '超额年仍有估算残余且尚未开始的已批准计划转为待复核');
+  assert(!r.body.flaggedPlans.some((p) => p.id === cp1),
+    '承载计划该年估算残余为 0（被替代实测全天覆盖），不转待复核');
+  // 409 下纠错已生效（与确认实测口径一致）
+  assert(r.body.detail.measurements.some((m) => m.id === cm1 && m.status === 'annulled'),
+    '409 响应详情中原记录已作废（纠错已生效）');
+  const cm2 = r.body.correction.replacementMeasurementId;
+  assert(r.body.detail.measurements.some((m) => m.id === cm2 && m.status === 'confirmed'),
+    '409 响应详情中替代记录已确认');
+  const flaggedReason = r.body.detail.plans.find((p) => p.id === cp2).review_reason;
+  assert(/纠错/.test(flaggedReason || '') && /超限/.test(flaggedReason || ''),
+    '待复核原因写明实测纠错与超限：' + flaggedReason);
+
+  // ---- 占用下降不自动恢复既有待复核计划 ----
+  // 把替代记录纠错回更小剂量（09-10 100lx = 100），2035 占用降到上限以下
+  r = await call('POST', `/api/measurements/${cm2}/correct`, {
+    startDate: '2035-06-01', startTime: '09:00',
+    endDate: '2035-06-01', endTime: '10:00', actualLux: 100, reason: '复测核对后改回小剂量',
+  }, 'c');
+  assert(r.status === 200, '纠错为更小剂量成功（占用下降）');
+  r = await call('GET', `/api/exhibits/${exCo2}`, null, 'i');
+  assert(r.body.years['2035'].over === false, '占用下降后不再超限');
+  assert(r.body.plans.find((p) => p.id === cp2).status === 'pending_review',
+    '占用下降不自动恢复既有待复核计划（仍为待复核，需保管员复核）');
+
+  // ---- 纠错替代时段与停灯相交被拒（停灯与实测互斥）----
+  const exCo3 = await createExhibit('纠错停灯展品');
+  const wallNow2 = dosing.tsToWall(Date.now());
+  const coYmd = wallNow2.ymd;
+  await call('POST', `/api/exhibits/${exCo3}/limits`,
+    { year: Number(coYmd.slice(0, 4)), limitLxh: 100000 }, 'c');
+  // 承载计划覆盖今天（已开始，仍可纠错），09-17
+  const bcp = await submitPlan(exCo3, '纠错停灯承载计划', coYmd, coYmd,
+    ['09:00-17:00'], 100);
+  await approvePlan(bcp);
+  // 已确认实测 09:00-10:00 = 100
+  r = await call('POST', '/api/measurements', {
+    planId: bcp, startDate: coYmd, startTime: '09:00',
+    endDate: coYmd, endTime: '10:00', actualLux: 100,
+  }, 'c');
+  const cm3 = r.body.measurement.id;
+  await call('POST', `/api/measurements/${cm3}/confirm`, {}, 'c');
+  // 一条停灯 11:00-12:00（直接 SQL 预置，保证确定性，不依赖当前时刻）
+  await dbModule.withTransaction(async (client) => {
+    const exRow = await client.query('SELECT exhibit_id FROM plans WHERE id = $1', [bcp]);
+    await client.query(
+      `INSERT INTO blackouts (plan_id, exhibit_id, start_ts, end_ts, reason, created_by)
+       VALUES ($1, $2, $3, $4, $5, NULL)`,
+      [bcp, exRow.rows[0].exhibit_id,
+        new Date(dosing.wallToTs(coYmd, 660)),
+        new Date(dosing.wallToTs(coYmd, 720)),
+        '纠错测试停灯']
+    );
+  });
+  r = await call('POST', `/api/measurements/${cm3}/correct`, {
+    startDate: coYmd, startTime: '10:30',
+    endDate: coYmd, endTime: '12:30', actualLux: 100, reason: '时段录错撞上停灯',
+  }, 'c');
+  assert(r.status === 409 && r.body.details.overlappingBlackouts.length === 1,
+    '替代时段与停灯相交：纠错被拒并指出停灯冲突');
+  r = await call('GET', `/api/exhibits/${exCo3}`, null, 'i');
+  assert(r.body.measurements.find((m) => m.id === cm3).status === 'confirmed',
+    '停灯冲突下原记录不变');
+
+  // ---- 草稿不能纠错（可删除重录）----
+  r = await call('POST', '/api/measurements', {
+    planId: bcp, startDate: coYmd, startTime: '13:00',
+    endDate: coYmd, endTime: '14:00', actualLux: 100,
+  }, 'c');
+  const cmDraft = r.body.measurement.id;
+  r = await call('POST', `/api/measurements/${cmDraft}/correct`, {
+    startDate: coYmd, startTime: '13:00',
+    endDate: coYmd, endTime: '14:30', actualLux: 110, reason: '草稿纠错',
+  }, 'c');
+  assert(r.status === 400 && /已确认/.test(r.body.error), '待确认草稿不能纠错（引导删除重录）');
+
+  // ---- 待复核/取消计划的已确认实测仍可纠错（只按原计划窗校验，不校验计划状态）----
+  // cp2 当前为 pending_review：其无实测；改为取消 bcp 后对其历史实测纠错验证状态放宽。
+  // （取消会连带计划退出占用，但实测记录仍保留可追溯、可纠错。）
+  await call('POST', `/api/plans/${bcp}/cancel`, {}, 'c');
+  r = await call('POST', `/api/measurements/${cm3}/correct`, {
+    startDate: coYmd, startTime: '09:00',
+    endDate: coYmd, endTime: '10:30', actualLux: 120, reason: '计划取消后更正历史实测',
+  }, 'c');
+  assert(r.status === 200, `计划取消后仍可对其已确认实测纠错（实际 ${r.status} ${r.body && r.body.error}）`);
+
+  // ---- 实测列表接口保持兼容并附追溯字段 ----
+  r = await call('GET', `/api/measurements?exhibitId=${exCo}`, null, 'i');
+  assert(r.body.measurements.some((m) => m.id === coMeas2 && m.replacesMeasurementId === coMeas1),
+    '实测列表（布展员只读）可追溯替代关系');
+  assert(r.body.measurements.every((m) => 'correctionReason' in m),
+    '既有实测列表字段保持兼容（仅附加纠错字段）');
+
   // 操作流水：停灯登记
   r = await call('GET', '/api/audit?limit=1000', null, 'c');
   assert(r.body.events.some((e) => e.action === 'blackout.create'),
     '操作流水记录了停灯登记');
-
-  // ---- 操作流水存在 ----
   r = await call('GET', '/api/audit?limit=1000', null, 'c');
   assert(r.status === 200 && r.body.events.some((e) => e.action === 'plan.approve'),
     '操作流水记录了审批事件');

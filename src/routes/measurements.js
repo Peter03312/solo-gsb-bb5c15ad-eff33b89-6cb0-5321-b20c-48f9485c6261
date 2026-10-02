@@ -16,6 +16,7 @@ const {
   getPlan,
   getOccupyingPlans,
   validateMeasurementWindow,
+  correctMeasurement,
   computeOccupancy,
   plansToFlag,
 } = require('../service');
@@ -34,6 +35,61 @@ function parseMeasurementBody(body) {
   const endMinute = parseTimeToMinutes(body.endTime);
   if (endDate < startDate) throw new ValidationError('实测结束日期不能早于开始日期');
   return { startDate, endDate, startMinute, endMinute };
+}
+
+/**
+ * 按「确认实测生效后的占用」找出超额自然年（沿用确认实测口径）。
+ * occupancy 必须是按 extraMeasurement 预演得到的占用结果；
+ * candidateYears 限定为本次剂量实际影响到的年份（新/旧实测按年剂量年份的并集），
+ * 避免把与本次操作无关、本已超限的年份也列入响应。
+ */
+function overflowInfoFromOccupancy(occupancy, candidateYears) {
+  const overflows = [];
+  const overflowYears = [];
+  for (const year of candidateYears) {
+    const info = occupancy.years[String(year)];
+    if (!info || info.limit === null) continue;
+    if (info.over) {
+      overflowYears.push(Number(year));
+      overflows.push({
+        year: Number(year),
+        limit: info.limit,
+        projected: info.used,
+        excess: Math.round((info.used - info.limit) * 1000) / 1000,
+      });
+    }
+  }
+  return { overflows, overflowYears };
+}
+
+/**
+ * 把超额年份对应的「同展品、已批准、该年仍有估算残余且尚未开始」的计划转待复核，
+ * 逐条写审计；返回被转计划的概要（与确认实测响应同构）。
+ */
+async function flagPlansForOverflow(client, actor, { exhibitId, occupancy, overflowYears, trigger, reason }) {
+  const activePlans = await getOccupyingPlans(client, exhibitId);
+  const flaggedTargets = plansToFlag(activePlans, occupancy, overflowYears, Date.now());
+  const flagged = flaggedTargets.map(({ plan: fp, firstStart }) => ({
+    id: fp.id,
+    title: fp.title,
+    firstStart: tsToWallString(firstStart),
+    overflowYears,
+  }));
+  for (const { plan: fp } of flaggedTargets) {
+    await client.query(
+      `UPDATE plans
+          SET status = 'pending_review',
+              review_reason = $2,
+              updated_at = now()
+        WHERE id = $1`,
+      [fp.id, reason(fp.id)]
+    );
+    await recordAudit(client, actor, 'plan.flag_review', 'plan', fp.id, {
+      ...trigger,
+      overflowYears,
+    });
+  }
+  return flagged;
 }
 
 // 实测列表（可按展品过滤）
@@ -188,31 +244,14 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
 
       let flagged = [];
       if (overflowYears.length > 0) {
-        const activePlans = await getOccupyingPlans(client, plan.exhibit_id);
-        const flaggedTargets = plansToFlag(activePlans, occupancy, overflowYears, Date.now());
-        flagged = flaggedTargets.map(({ plan: fp, firstStart }) => ({
-          id: fp.id,
-          title: fp.title,
-          firstStart: tsToWallString(firstStart),
+        flagged = await flagPlansForOverflow(client, req.sessionUser, {
+          exhibitId: plan.exhibit_id,
+          occupancy,
           overflowYears,
-        }));
-        for (const { plan: fp } of flaggedTargets) {
-          await client.query(
-            `UPDATE plans
-                SET status = 'pending_review',
-                    review_reason = $2,
-                    updated_at = now()
-              WHERE id = $1`,
-            [
-              fp.id,
-              `实测 #${id} 确认后导致 ${overflowYears.join('、')} 年额度超限，转待复核`,
-            ]
-          );
-          await recordAudit(client, req.sessionUser, 'plan.flag_review', 'plan', fp.id, {
-            triggerMeasurementId: id,
-            overflowYears,
-          });
-        }
+          trigger: { triggerMeasurementId: id },
+          reason: () =>
+            `实测 #${id} 确认后导致 ${overflowYears.join('、')} 年额度超限，转待复核`,
+        });
       }
 
       const detail = await exhibitDetail(client, plan.exhibit_id, { lock: true });
@@ -234,6 +273,134 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
       });
     }
     res.json(result.detail);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * 保管员对「已确认实测」发起纠错：
+ * 用原记录编号（路径 :id）、替代时段、替代照度与必填原因，在展品锁事务内：
+ *   1. 校验（service.correctMeasurement）：原记录已确认；替代时段正时长、完整处于原计划开灯窗内；
+ *      不与同展品其他未作废实测（含草稿）或停灯相交；替代照度为正、原因必填。
+ *      非法输入 400；相交冲突 409（details 一次性列出全部冲突），失败原记录与额度均不变。
+ *   2. 通过后保留旧记录并标记作废，确认替代记录（直接 confirmed），写入两者关联与审计。
+ *   3. 按既有自然年口径重算已确认实测与估算残余（展品详情即反映最新占用）。
+ *   4. 若纠错使年度超额，沿用确认实测的生效与冲突响应口径：
+ *      纠错照常生效，把相关年度仍有估算残余且尚未开始的已批准计划转待复核（写明原因），
+ *      返回 409 与年份/超额量/被转计划；占用下降不自动恢复任何既有待复核计划。
+ */
+router.post('/:id/correct', requireRole('conservator'), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) throw new ValidationError('实测记录 ID 无效');
+    const { startDate, endDate, startMinute, endMinute } = parseMeasurementBody(req.body || {});
+    const actualLux = positiveNumber(req.body.actualLux, '替代实测照度（lx）', { max: 1000000 });
+    const reason = req.body && typeof req.body.reason === 'string'
+      ? req.body.reason.trim() : '';
+    if (!reason) throw new ValidationError('纠错原因不能为空');
+
+    const preRow = await query('SELECT exhibit_id FROM measurements WHERE id = $1', [id]);
+    if (preRow.rows.length === 0) throw new ValidationError('实测记录不存在');
+    const exhibitId = preRow.rows[0].exhibit_id;
+
+    const result = await withExhibitTransaction(exhibitId, async (client) => {
+      await lockExhibit(client, exhibitId);
+
+      const corrected = await correctMeasurement(client, id, {
+        startDate, endDate, startMinute, endMinute, actualLux, reason,
+      }, req.sessionUser);
+      const { plan, original, replacement, startMs, endMs, lux } = corrected;
+
+      const oldYearly = yearMapToObject(
+        doseByYear(
+          [{ start: new Date(original.start_ts).getTime(), end: new Date(original.end_ts).getTime() }],
+          Number(original.actual_lux)
+        )
+      );
+      const newYearly = yearMapToObject(doseByYear([{ start: startMs, end: endMs }], lux));
+      const candidateYears = new Set(
+        [...Object.keys(oldYearly), ...Object.keys(newYearly)].map(Number)
+      );
+
+      // 纠错生效后的占用：原记录已置 annulled（不再计量），替代记录为 confirmed。
+      const occupancy = await computeOccupancy(client, plan.exhibit_id);
+      const { overflows, overflowYears } = overflowInfoFromOccupancy(occupancy, candidateYears);
+
+      await recordAudit(client, req.sessionUser, 'measurement.correct', 'measurement',
+        replacement.id, {
+          exhibitId: plan.exhibit_id,
+          planId: plan.id,
+          originalMeasurementId: id,
+          replacementMeasurementId: replacement.id,
+          reason,
+          from: {
+            start: tsToWallString(new Date(original.start_ts).getTime()),
+            end: tsToWallString(new Date(original.end_ts).getTime()),
+            actualLux: Number(original.actual_lux),
+            yearly: oldYearly,
+          },
+          to: {
+            start: tsToWallString(startMs),
+            end: tsToWallString(endMs),
+            actualLux: lux,
+            yearly: newYearly,
+          },
+          overflows,
+        });
+
+      let flagged = [];
+      if (overflowYears.length > 0) {
+        flagged = await flagPlansForOverflow(client, req.sessionUser, {
+          exhibitId: plan.exhibit_id,
+          occupancy,
+          overflowYears,
+          trigger: { triggerMeasurementId: replacement.id, correctedMeasurementId: id },
+          reason: () =>
+            `实测 #${id} 纠错为 #${replacement.id} 后导致 ${overflowYears.join('、')} 年额度超限，转待复核`,
+        });
+      }
+
+      const detail = await exhibitDetail(client, plan.exhibit_id, { lock: true });
+      const correction = {
+        originalMeasurementId: id,
+        replacementMeasurementId: replacement.id,
+        reason,
+        original: {
+          id,
+          start: tsToWallString(new Date(original.start_ts).getTime()),
+          end: tsToWallString(new Date(original.end_ts).getTime()),
+          actualLux: Number(original.actual_lux),
+          yearly: oldYearly,
+        },
+        replacement: {
+          id: replacement.id,
+          start: tsToWallString(startMs),
+          end: tsToWallString(endMs),
+          actualLux: lux,
+          yearly: newYearly,
+        },
+      };
+      return { detail, overflows, flagged, correction };
+    });
+
+    if (result.overflows.length > 0) {
+      // 纠错已生效但造成超限：沿用确认实测口径，用 409 报告年份、超额量及被转待复核的计划
+      return res.status(409).json({
+        message:
+          `实测纠错已生效（#${result.correction.originalMeasurementId} → ` +
+          `#${result.correction.replacementMeasurementId}），但纠错后超限：` +
+          result.overflows.map((o) => `${o.year} 年超出 ${o.excess} lx·h`).join('；') +
+          (result.flagged.length
+            ? `。已将 ${result.flagged.length} 条尚未开始的计划转为待复核`
+            : '；该年度没有尚未开始的已批准计划'),
+        overflows: result.overflows,
+        flaggedPlans: result.flagged,
+        correction: result.correction,
+        detail: result.detail,
+      });
+    }
+    res.json({ ...result.detail, correction: result.correction });
   } catch (err) {
     next(err);
   }
