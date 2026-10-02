@@ -21,8 +21,54 @@ function serializeMeasurement(m) {
     actualLux: Number(m.actual_lux),
     status: m.status,
     note: m.note,
+    // 纠错追溯字段（仅附加，既有消费者不受影响）：
+    // correctedReason 为该记录作废/替代时的必填纠错原因；
+    // correctionOfMeasurementId 指向被本记录替代的原记录（仅替代记录有值）。
+    correctedReason: m.corrected_reason != null ? m.corrected_reason : null,
+    correctionOfMeasurementId:
+      m.correction_of_measurement_id != null ? Number(m.correction_of_measurement_id) : null,
+    annulledAt: m.annulled_at || null,
     createdAt: m.created_at,
   };
+}
+
+/**
+ * 构造展品实测的纠错关联视图：把同一纠错链（原记录 → 替代记录，可链式追溯）
+ * 按“原记录（根）”归并成组，组内按 id 正序排列（原记录在前、替代记录在后），
+ * 供展品详情前后追溯。rows 为 serializeMeasurement 之后的记录数组。
+ */
+function buildMeasurementCorrections(rows) {
+  const byId = new Map(rows.map((m) => [m.id, m]));
+
+  // 沿 correctionOfMeasurementId 走到链的根（防御环引用）
+  const rootOf = (startId) => {
+    let curId = startId;
+    const seen = new Set();
+    while (true) {
+      const cur = byId.get(curId);
+      const parentId = cur ? cur.correctionOfMeasurementId : null;
+      if (parentId == null || !byId.has(parentId) || seen.has(curId)) return curId;
+      seen.add(curId);
+      curId = parentId;
+    }
+  };
+
+  const groups = new Map(); // rootId -> 记录数组
+  for (const m of rows) {
+    const rootId = rootOf(m.id);
+    if (!groups.has(rootId)) groups.set(rootId, []);
+    groups.get(rootId).push(m);
+  }
+
+  const out = [];
+  for (const [rootId, chainRows] of groups) {
+    // 仅包含真正发生过纠错的链（链内存在带 correctionOfMeasurementId 的替代记录）
+    if (!chainRows.some((m) => m.correctionOfMeasurementId != null)) continue;
+    const chain = chainRows.sort((a, b) => a.id - b.id);
+    const latest = chain[chain.length - 1];
+    out.push({ rootId, latestId: latest.id, reason: latest.correctedReason, chain });
+  }
+  return out.sort((a, b) => b.latestId - a.latestId);
 }
 
 async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
@@ -50,6 +96,9 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     )
   ).rows.map(serializeMeasurement);
 
+  // 实测纠错关联（原记录 → 替代记录，可链式追溯），仅附加新字段，不改变既有 measurements 列表
+  const corrections = buildMeasurementCorrections(measurements);
+
   // 停灯记录（保留、不可改删）及各年扣减量；既有查询字段不变，仅附加新字段
   // 延迟 require 以避免与 routes/blackouts 形成循环依赖
   const { serializeBlackoutViewItem } = require('./blackouts');
@@ -62,6 +111,7 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     sources: occupancy.sources,
     plans,
     measurements,
+    corrections,
     blackouts,
     blackoutDeductionYearly,
   };
@@ -384,4 +434,4 @@ router.post('/:id/limits', requireRole('conservator'), async (req, res, next) =>
   }
 });
 
-module.exports = { router, exhibitDetail, serializeMeasurement };
+module.exports = { router, exhibitDetail, serializeMeasurement, buildMeasurementCorrections };

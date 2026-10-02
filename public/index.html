@@ -108,6 +108,7 @@
             <thead><tr><th>#</th><th>计划</th><th>开始</th><th>结束</th><th>实测照度</th><th>状态</th><th>操作</th></tr></thead>
             <tbody id="detail-meas-tbody"></tbody>
           </table>
+          <div id="detail-corrections" class="hidden"></div>
 
           <h4>停灯记录（永久保留，不可修改/删除）</h4>
           <p class="muted small">停灯只从所属计划“未被已确认实测覆盖”的估算时段中扣减（按自然年拆分）；
@@ -203,6 +204,9 @@
           <label>备注（可选）<input name="note" maxlength="1000" /></label>
           <button class="primary" type="submit">录入（待确认）</button>
           <p class="muted small">确认后该时段以实测剂量替代估算；重叠实测会被拒绝。若迟到实测导致超限，相应年度尚未开始的计划自动转「待复核」。</p>
+          <p class="muted small">已确认实测事后发现时段/照度录错时，在该记录行点「发起纠错」：需填写替代时段、替代照度与必填原因；
+            替代时段仍须完整处于原计划开灯窗内且不与其他未作废实测或停灯相交。旧记录保留作废、替代记录直接确认，
+            纠错后按自然年重算；若造成超额同样转未开始计划为待复核，占用下降不自动恢复。</p>
         </form>
         <div id="meas-list"></div>
       </section>

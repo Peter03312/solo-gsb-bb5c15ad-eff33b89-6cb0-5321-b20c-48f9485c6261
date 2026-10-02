@@ -219,6 +219,7 @@ function renderDetail() {
     '<tr><td colspan="7" class="muted">暂无计划</td></tr>';
   $('#detail-meas-tbody').innerHTML = d.measurements.map(measRow).join('') ||
     '<tr><td colspan="7" class="muted">暂无实测</td></tr>';
+  renderCorrections(d);
   renderBlackouts(d);
 
   $$('.plan-action').forEach((btn) => btn.addEventListener('click', () => planAction(btn)));
@@ -226,6 +227,40 @@ function renderDetail() {
   $$('.adj-action').forEach((btn) => btn.addEventListener('click', () => adjustmentAction(btn)));
   $$('.adj-open').forEach((btn) => btn.addEventListener('click', () => openAdjustmentForm(Number(btn.dataset.id))));
   renderPairBox();
+}
+
+/** 渲染实测纠错链（原记录 → 替代记录），展品详情可前后追溯记录与原因。 */
+function renderCorrections(d) {
+  const box = $('#detail-corrections');
+  if (!box) return;
+  const corrections = d.corrections || [];
+  if (!corrections.length) {
+    box.innerHTML = '';
+    box.classList.add('hidden');
+    return;
+  }
+  box.classList.remove('hidden');
+  box.innerHTML = `<h4 style="margin:10px 0 4px">实测纠错记录（旧记录保留，可前后追溯）</h4>` +
+    corrections.map((g) => {
+    const rows = g.chain.map((m, idx) => {
+      const tag = idx === g.chain.length - 1
+        ? '<span class="ok small">当前生效</span>'
+        : '<span class="muted small">已作废保留</span>';
+      return `<tr class="${m.status === 'annulled' ? 'over-row' : ''}">
+        <td>#${m.id} ${tag}</td>
+        <td>#${m.planId}</td>
+        <td>${esc(m.start)} ~ ${esc(m.end)}</td>
+        <td class="mono">${fmtN(m.actualLux)}</td>
+        <td>${badge(m.status)}</td>
+      </tr>`;
+    }).join('');
+    return `<div class="adj-box" style="margin:6px 0">
+      <div class="adj-head">纠错链：原记录 #${g.rootId} → 当前记录 #${g.latestId}
+        <span class="muted small">原因：${esc(g.reason || '')}</span></div>
+      <table class="data"><thead><tr><th>记录</th><th>所属计划</th><th>时段</th><th>照度 lx</th><th>状态</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+    </div>`;
+  }).join('');
 }
 
 /** 渲染停灯记录与各年扣减量，并填充登记表单的计划下拉（仅已批准/待复核）。 */
@@ -388,18 +423,33 @@ function pendingAdjustmentBlock(p) {
     <div class="adj-btns">${btns.join(' ')}</div>
   </div>`;
 }
+function measCorrectionHtml(m) {
+  // 展品详情实测行的纠错追溯标记
+  if (m.status === 'annulled' && m.correctedReason != null) {
+    return `<div class="small muted">已纠错作废${m.correctedReason ? '：' + esc(m.correctedReason) : ''}</div>`;
+  }
+  if (m.correctionOfMeasurementId != null) {
+    return `<div class="small ok">替代记录（原记录 #${m.correctionOfMeasurementId}）${m.correctedReason ? '：' + esc(m.correctedReason) : ''}</div>`;
+  }
+  return '';
+}
 function measRow(m) {
   const plan = (state.detail.plans || []).find((p) => p.id === m.planId);
-  return `<tr>
+  const isCustodian = state.user.role === 'conservator';
+  let actions = '<span class="muted">—</span>';
+  if (m.status === 'draft' && isCustodian) {
+    actions = `<button class="primary small-btn meas-action" data-action="confirm" data-id="${m.id}">确认</button>
+         <button class="danger small-btn meas-action" data-action="delete" data-id="${m.id}">删除</button>`;
+  } else if (m.status === 'confirmed' && isCustodian) {
+    actions = `<button class="small-btn meas-action" data-action="correct" data-id="${m.id}">发起纠错</button>`;
+  }
+  return `<tr${m.status === 'annulled' ? ' class="over-row"' : ''}>
     <td>${m.id}</td>
     <td>#${m.planId} ${esc(plan ? plan.title : '')}</td>
     <td>${esc(m.start)}</td><td>${esc(m.end)}</td>
     <td class="mono">${fmtN(m.actualLux)}</td>
-    <td>${badge(m.status)}</td>
-    <td>${m.status === 'draft' && state.user.role === 'conservator'
-      ? `<button class="primary small-btn meas-action" data-action="confirm" data-id="${m.id}">确认</button>
-         <button class="danger small-btn meas-action" data-action="delete" data-id="${m.id}">删除</button>`
-      : '<span class="muted">—</span>'}</td>
+    <td>${badge(m.status)}${measCorrectionHtml(m)}</td>
+    <td>${actions}</td>
   </tr>`;
 }
 
@@ -589,6 +639,9 @@ async function measAction(btn) {
     if (action === 'delete') {
       if (!confirm(`删除待确认实测 #${id}？`)) return;
       await api('DELETE', `/api/measurements/${id}`);
+    } else if (action === 'correct') {
+      await correctMeasurement(Number(id));
+      return;
     } else if (action === 'confirm') {
       try {
         const detail = await api('POST', `/api/measurements/${id}/confirm`);
@@ -616,6 +669,73 @@ async function measAction(btn) {
     }
     await refreshAfterChange();
   } catch (err) {
+    flash('error', err.message);
+  }
+}
+
+/**
+ * 保管员对已确认实测发起纠错（原记录编号取自按钮 data-id）：
+ * 用 prompt 收集替代时段、替代照度与必填原因；成功后旧记录标记作废、替代记录生效。
+ */
+async function correctMeasurement(id) {
+  let m = null;
+  if (state.detail) m = (state.detail.measurements || []).find((x) => x.id === id);
+  if (!m) {
+    const { measurements } = await api('GET', '/api/measurements');
+    m = measurements.find((x) => x.id === id);
+  }
+  if (!m) { flash('error', '未找到原实测记录'); return; }
+  if (!confirm(`对已确认实测 #${id}（${m.start} ~ ${m.end}，${m.actualLux} lx）发起纠错？\n原记录将保留并标记作废，替代时段仍须完整处于原计划开灯窗内。`)) return;
+
+  const [origStartDate, origStartTime] = m.start.split(' ');
+  const [origEndDate, origEndTime] = m.end.split(' ');
+  const startDate = prompt('替代实测开始日期（YYYY-MM-DD）', origStartDate);
+  if (startDate === null) return;
+  const startTime = prompt('替代实测开始时间（HH:MM）', origStartTime);
+  if (startTime === null) return;
+  const endDate = prompt('替代实测结束日期（YYYY-MM-DD，同日可直接回车）', origEndDate) || startDate;
+  const endTime = prompt('替代实测结束时间（HH:MM）', origEndTime);
+  if (endTime === null) return;
+  const actualLux = Number(prompt('替代实测照度（lx，正数）', String(m.actualLux)));
+  if (!(actualLux > 0)) { flash('error', '替代照度必须为正数'); return; }
+  const reason = prompt('纠错原因（必填）', '');
+  if (reason === null) return;
+  if (!reason.trim()) { flash('error', '纠错原因必填'); return; }
+
+  try {
+    const detail = await api('POST', `/api/measurements/${id}/correct`, {
+      startDate: startDate.trim(), startTime: startTime.trim(),
+      endDate: (endDate || startDate).trim(), endTime: endTime.trim(),
+      actualLux, reason: reason.trim(),
+    });
+    state.detail = detail;
+    renderDetail();
+    flash('success', `实测 #${id} 已纠错：旧记录保留并标记作废，替代记录 #${detail.correction.newMeasurement.id} 已确认`);
+  } catch (err) {
+    if (err.status === 409 && err.data && err.data.overflows) {
+      const html = '<ul>' + err.data.overflows.map((o) =>
+        `<li>${o.year} 年：上限 ${fmtN(o.limit)}，纠错后合计 ${fmtN(o.projected)}，<b>超额 ${fmtN(o.excess)} lx·h</b></li>`
+      ).join('') + '</ul>'
+        + (err.data.flaggedPlans && err.data.flaggedPlans.length
+          ? '<div>已转为待复核的计划：' + err.data.flaggedPlans.map((p) => `#${p.id}《${esc(p.title)}》`).join('、') + '</div>'
+          : '');
+      if (err.data.detail) {
+        state.detail = err.data.detail;
+        renderDetail();
+      }
+      flash('warn', '实测纠错已生效，但造成年度超限', html);
+      return;
+    }
+    if (err.status === 409 && err.data && err.data.details) {
+      const det = err.data.details;
+      const items = [];
+      (det.overlappingMeasurements || []).forEach((x) =>
+        items.push(`与${x.status === 'draft' ? '待确认' : '已确认'}实测 #${x.id}（${esc(x.start)} ~ ${esc(x.end)}）相交`));
+      (det.overlappingBlackouts || []).forEach((x) =>
+        items.push(`与停灯记录 #${x.id}（计划「${esc(x.planTitle || '')}」，${esc(x.start)} ~ ${esc(x.end)}）相交`));
+      flash('error', err.message, items.length ? '<ul>' + items.map((x) => `<li>${x}</li>`).join('') + '</ul>' : '');
+      return;
+    }
     flash('error', err.message);
   }
 }
@@ -960,17 +1080,28 @@ async function loadMeasurementsTab() {
   $('#meas-list').innerHTML = measurements.length
     ? `<table class="data"><thead><tr>
         <th>#</th><th>计划</th><th>开始</th><th>结束</th><th>实测照度</th><th>状态</th><th>操作</th></tr></thead>
-        <tbody>${measurements.map((m) => `
-          <tr>
+        <tbody>${measurements.map((m) => {
+          let actions = '<span class="muted">—</span>';
+          if (m.status === 'draft' && state.user.role === 'conservator') {
+            actions = `<button class="primary small-btn meas-action" data-action="confirm" data-id="${m.id}">确认</button>
+                       <button class="danger small-btn meas-action" data-action="delete" data-id="${m.id}">删除</button>`;
+          } else if (m.status === 'confirmed' && state.user.role === 'conservator') {
+            actions = `<button class="small-btn meas-action" data-action="correct" data-id="${m.id}">发起纠错</button>`;
+          }
+          return `
+          <tr${m.status === 'annulled' ? ' class="over-row"' : ''}>
             <td>${m.id}</td><td>#${m.planId}</td>
             <td>${esc(m.start)}</td><td>${esc(m.end)}</td>
             <td class="mono">${fmtN(m.actualLux)} lx</td>
-            <td>${badge(m.status)}</td>
-            <td>${m.status === 'draft' && state.user.role === 'conservator'
-              ? `<button class="primary small-btn meas-action" data-action="confirm" data-id="${m.id}">确认</button>
-                 <button class="danger small-btn meas-action" data-action="delete" data-id="${m.id}">删除</button>`
-              : '<span class="muted">—</span>'}</td>
-          </tr>`).join('')}</tbody></table>`
+            <td>${badge(m.status)}
+              ${m.status === 'annulled' && m.correctedReason
+                ? `<div class="small muted">已纠错作废：${esc(m.correctedReason)}</div>` : ''}
+              ${m.correctionOfMeasurementId != null
+                ? `<div class="small ok">替代记录（原记录 #${m.correctionOfMeasurementId}）</div>` : ''}
+            </td>
+            <td>${actions}</td>
+          </tr>`;
+        }).join('')}</tbody></table>`
     : '<p class="muted">暂无实测记录。</p>';
   $$('.meas-action').forEach((b) => b.addEventListener('click', () => measAction(b)));
 }

@@ -85,6 +85,12 @@ CREATE INDEX IF NOT EXISTS idx_adjustment_plan ON plan_adjustments (plan_id, id)
 
 -- 实测记录：先录入（draft），保管员确认（confirmed）后以实测替代估算；
 -- annulled 表示登记作废（原始记录保留）。
+-- 已确认实测纠错（measurement.correct）：
+--   * corrected_reason 记录本次纠错的必填原因（旧记录的作废原因、替代记录的替代原因，同值写入）；
+--   * 原记录被纠错时：status='annulled'，corrected_reason 填原因；
+--   * 替代记录为新建的 confirmed 行，correction_of_measurement_id 指向原记录；
+--   * 两者同属原计划（替代记录 plan_id/exhibit_id 与原记录一致）。
+-- 原记录与替代记录均永久保留、不可改删，经展品详情的 corrections 关联可前后追溯。
 CREATE TABLE IF NOT EXISTS measurements (
     id              BIGSERIAL PRIMARY KEY,
     plan_id         BIGINT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
@@ -95,6 +101,8 @@ CREATE TABLE IF NOT EXISTS measurements (
     note            TEXT,
     status          TEXT NOT NULL DEFAULT 'draft'
                     CHECK (status IN ('draft','confirmed','annulled')),
+    corrected_reason            TEXT,
+    correction_of_measurement_id BIGINT REFERENCES measurements(id),
     created_by      BIGINT REFERENCES users(id),
     confirmed_by    BIGINT REFERENCES users(id),
     confirmed_at    TIMESTAMPTZ,
@@ -104,6 +112,13 @@ CREATE TABLE IF NOT EXISTS measurements (
 );
 CREATE INDEX IF NOT EXISTS idx_meas_exhibit_status ON measurements (exhibit_id, status);
 CREATE INDEX IF NOT EXISTS idx_meas_plan ON measurements (plan_id);
+CREATE INDEX IF NOT EXISTS idx_meas_correction_of ON measurements (correction_of_measurement_id);
+
+-- 已初始化库的兼容升级：补加纠错关联字段（CREATE TABLE IF NOT EXISTS 不会改既有表）。
+ALTER TABLE measurements
+    ADD COLUMN IF NOT EXISTS corrected_reason TEXT,
+    ADD COLUMN IF NOT EXISTS correction_of_measurement_id BIGINT REFERENCES measurements(id);
+CREATE INDEX IF NOT EXISTS idx_meas_correction_of ON measurements (correction_of_measurement_id);
 
 -- 停灯记录：保管员对已批准/待复核计划登记“已发生”的停灯时段（必填原因）。
 -- 停灯时段只从所属计划“未被已确认实测覆盖”的估算时段中扣减剂量（按墙上自然年拆分），

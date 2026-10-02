@@ -442,6 +442,106 @@ async function validateMeasurementWindow(client, plan, startYmd, startMinute, en
 }
 
 /**
+ * 已确认实测纠错的核对（由路由在展品锁事务内、锁定原实测行后调用）。
+ * 保管员可用“原记录编号 + 替代时段 + 替代照度 + 必填原因”对已确认实测发起纠错：
+ *   1) 原记录必须存在且为 confirmed（草稿应直接删除；已作废记录不能再纠错）；
+ *   2) 替代时段起点早于终点，且必须**完整**处于原记录所属计划的开灯窗内
+ *      （替代记录仍属原计划：不得改挂其他计划）；
+ *   3) 替代时段不得与同展品其他**未作废实测（含待确认草稿）**相交（排除原记录自身）；
+ *   4) 替代时段不得与同展品任何**停灯记录**相交（停灯与实测互斥）；
+ *   5) 替代照度必须为正数。
+ * 非法数值/越窗类错误抛 400；相交冲突一次性收集后抛 409（details 指出全部冲突）。
+ * 本函数只核对、不写库；核对失败时原记录与额度均不变。
+ * 返回 { measurement, plan, start, end, windows, actualLux, reason }。
+ */
+async function prepareMeasurementCorrection(
+  client,
+  measurement,
+  { startYmd, startMinute, endYmd, endMinute, actualLux, reason }
+) {
+  if (!measurement) throw new ValidationError('实测记录不存在');
+  if (measurement.status === 'annulled') {
+    throw new ValidationError('原实测记录已作废（可能已被纠错），不能再次发起纠错');
+  }
+  if (measurement.status !== 'confirmed') {
+    throw new ValidationError('只有已确认的实测记录才能纠错；待确认草稿可直接删除后重新录入');
+  }
+  const reasonText = nonEmptyString(reason, '纠错原因', 1000);
+  const lux = positiveNumber(actualLux, '替代实测照度（lx）', { max: 1000000 });
+
+  const plan = await getPlan(client, measurement.plan_id);
+  const start = wallToTs(startYmd, startMinute);
+  const end = wallToTs(endYmd, endMinute);
+  if (!(end > start)) throw new ValidationError('替代实测时段结束必须晚于开始');
+
+  // 越窗（未完整处于原计划开灯窗内）属非法输入（400）
+  const windows = planWindows(plan);
+  const seg = { start, end };
+  if (!windows.some((w) => containsInterval(w, seg))) {
+    throw new ValidationError(
+      `替代实测时段 ${tsToWallString(start)} ~ ${tsToWallString(end)} ` +
+        `没有完整处于原计划 #${plan.id}「${plan.title}」的开灯窗内，纠错被拒绝`
+    );
+  }
+
+  // 冲突一次性收集：同展品其他未作废实测（含草稿，排除原记录）与全部停灯记录
+  const { rows: measRows } = await client.query(
+    `SELECT id, plan_id, start_ts, end_ts, status
+       FROM measurements
+      WHERE exhibit_id = $1 AND id <> $2 AND status <> 'annulled'
+        AND start_ts < $3 AND end_ts > $4
+      ORDER BY id`,
+    [plan.exhibit_id, measurement.id, new Date(end), new Date(start)]
+  );
+  const { rows: blackoutRows } = await client.query(
+    `SELECT id, plan_id, start_ts, end_ts FROM blackouts
+      WHERE exhibit_id = $1
+        AND start_ts < $3 AND end_ts > $2
+      ORDER BY id`,
+    [plan.exhibit_id, new Date(start), new Date(end)]
+  );
+  if (measRows.length > 0 || blackoutRows.length > 0) {
+    const planIds = [...new Set(blackoutRows.map((b) => Number(b.plan_id)))];
+    const titleMap = new Map();
+    if (planIds.length > 0) {
+      const placeholders = planIds.map((_, i) => `$${i + 1}`).join(',');
+      const tRows = await client.query(
+        `SELECT id, title FROM plans WHERE id IN (${placeholders})`,
+        planIds
+      );
+      for (const t of tRows.rows) titleMap.set(Number(t.id), t.title);
+    }
+    const overlappingMeasurements = measRows.map((m) => ({
+      id: m.id,
+      planId: m.plan_id,
+      status: m.status,
+      start: tsToWallString(new Date(m.start_ts).getTime()),
+      end: tsToWallString(new Date(m.end_ts).getTime()),
+    }));
+    const overlappingBlackouts = blackoutRows.map((b) => ({
+      id: b.id,
+      planId: b.plan_id,
+      planTitle: titleMap.get(Number(b.plan_id)) || null,
+      start: tsToWallString(new Date(b.start_ts).getTime()),
+      end: tsToWallString(new Date(b.end_ts).getTime()),
+    }));
+    const parts = [];
+    for (const m of overlappingMeasurements) {
+      parts.push(`与${m.status === 'draft' ? '待确认' : '已确认'}实测 #${m.id}（${m.start} ~ ${m.end}）相交`);
+    }
+    for (const b of overlappingBlackouts) {
+      parts.push(`与停灯记录 #${b.id}（计划「${b.planTitle}」，${b.start} ~ ${b.end}）相交`);
+    }
+    throw new ConflictError(
+      `实测 #${measurement.id} 纠错核对失败：${parts.join('；')}；原记录与额度均未改变`,
+      { overlappingMeasurements, overlappingBlackouts }
+    );
+  }
+
+  return { measurement, plan, start, end, windows, actualLux: lux, reason: reasonText };
+}
+
+/**
  * 校验并登记停灯时段（由路由在展品锁事务内调用）：
  *  - 计划必须为已批准或待复核
  *  - 起点须早于终点；结束不得晚于当前时间（只登记已发生时段）
@@ -1599,6 +1699,7 @@ module.exports = {
   buildOverflows,
   planOverlaps,
   validateMeasurementWindow,
+  prepareMeasurementCorrection,
   plansToFlag,
   computeLimitPreview,
   yearOfTs,
